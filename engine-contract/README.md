@@ -425,9 +425,12 @@ reported explicitly.
 
 Each case records its normalized value, the pending exception name, and the `apis` it calls. A
 case that panics records a `panic` field instead.
-`compare.py` ignores the `engine` field. `quickjs-difference-allowlist.toml` is the only difference list for
-the SpiderMonkey/QuickJS comparison: an entry names one case, the fields that may differ, its
-`status`, `severity`, `reason` and `owner`. `accepted` and `wontfix` release an accepted
+`compare.py` checks that each file carries its engine's `engine` marker and then drops it.
+`quickjs-difference-allowlist.toml` is the only difference list for
+the SpiderMonkey/QuickJS comparison: an entry names one case, what may differ, its
+`status`, `severity`, `reason` and `owner`. `fields` lists the record keys that may differ
+(`apis`, `exception`) and single observation fields as `fields.<name>`; every other field
+recorded by both engines is still compared, and an `exit` key always fails. `accepted` and `wontfix` release an accepted
 behaviour difference, while `known-bug` releases a QuickJS shim defect and requires an `issue`;
 all three stay in the report. `pending` and `bug` fail the run. `severity` is `P0`-`P3`, and a
 `P0`/`P1` entry cannot be released as accepted, wontfix or known-bug. An unlisted or malformed
@@ -435,14 +438,14 @@ entry fails the run. An optional
 `issue` may point at the tracking issue for a difference that is still present; `pending`,
 `bug` and `known-bug` entries must have one, while accepted/wontfix entries may omit it. One issue
 covers one defect: a `known-bug` entry that points at a shared umbrella issue hides which defect is
-reported. Until the issue exists, `known-bug-issues.md` holds the ready-to-file text and the entry
-names it as `unfiled: engine-contract/known-bug-issues.md#N`. `panic` is an optional
+reported; `known-bug-issues.md` maps each entry to its issue. `panic` is an optional
 exact fingerprint for a panicking case: when present, the QuickJS `panic` text must match it
-character for character, and a QuickJS panic on an entry without one is a mismatch. `steps` is an
-optional list of sub-scenario names: every `fields.step_failures` entry on either engine must name
-a step in that list. Because a case-level `fields` entry would otherwise absorb a newly exposed
-step, add `steps` to every allowlist entry for a compound case so a new failing sub-scenario fails
-the comparison instead of hiding behind an old first panic. A fixed
+character for character, and a QuickJS panic on an entry without one is a mismatch. A panicking
+case stops recording and a failed step drops its own observations, so fields that only
+SpiderMonkey recorded are accepted only behind a matching `panic`. `steps` lists the
+sub-scenarios that fail on QuickJS, needs `panic` (the first failing step's), and must equal the
+steps in `fields.step_failures`: a newly failing step fails the comparison. A listed field, step or
+`panic` that no longer applies is reported as a stale entry with what to remove from it. A fixed
 difference is removed from this file and recorded in `quickjs-shim-fix-records.md`; `check-quickjs-shim-fixes` rejects a removed
 entry without a complete record, and rejects a record whose case id is not in the runtime
 inventory. An entry for a case that participated in both runs but no longer differs is stale and

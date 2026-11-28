@@ -20,9 +20,15 @@ defect, and status `known-bug` as a tracked shim defect; neither fails the run. 
 difference with status `pending` or `bug` still fails, as does an unlisted difference. When
 ``CASES.json`` is supplied, both engine runs must contain exactly those case ids; a truncated or
 stale run therefore fails instead of comparing a subset.
+An entry releases only what it names: top-level keys (`apis`, `exception`) and single
+observation fields (`fields.<name>`); every other field present in both runs is still compared,
+and an `exit` key, which marks a case process that failed after recording, always fails.
+Fields that QuickJS did not record are accepted only when its panic matches the entry's `panic`
+fingerprint, and the steps that failed must be exactly the entry's `steps`.
 An entry whose listed case participated in both runs but no longer differs is stale and fails the
-run. When both runtime inventories are marked complete, an entry for a case that no longer exists
-is stale as well. Entries are never silent skips.
+run, and so is a listed field, step or panic that no longer applies; the report says what to
+remove. When both runtime inventories are marked complete, an entry for a case that no longer
+exists is stale as well. Entries are never silent skips.
 
 Use ``--sm-cases`` and ``--qjs-cases`` when the two engines write their own runtime case
 inventories. Each engine's JSONL is then checked against its own inventory, and the inventories
@@ -36,9 +42,14 @@ import tomllib
 
 DIFFERENCE_STATUSES = ("pending", "bug", "known-bug", "accepted", "wontfix")
 DIFFERENCE_SEVERITIES = ("P0", "P1", "P2", "P3")
-REQUIRED_FIELDS = ("id", "fields", "reason", "owner", "status", "severity")
-OPTIONAL_FIELDS = ("issue", "steps")
+REQUIRED_FIELDS = ("id", "reason", "owner", "status", "severity")
+OPTIONAL_FIELDS = ("fields", "issue", "panic", "steps")
 RELEASED_STATUSES = frozenset(("accepted", "wontfix", "known-bug"))
+# Record keys besides `id` and `fields` that an entry may list. `exit`, which the isolated runner
+# adds when a case process failed after recording, is deliberately not listable.
+TOP_LEVEL_KEYS = ("apis", "exception")
+# Observation fields that the `panic` fingerprint and `steps` settle instead of a field name.
+FAILURE_FIELDS = ("panic", "step_failures")
 
 
 def load(path, expected_engine):
@@ -101,11 +112,38 @@ def load_differences(path):
                 f"{', '.join(missing)}"
             )
         case_id = entry["id"]
-        fields = entry["fields"]
-        if not isinstance(fields, list) or not fields or not all(
+        unknown = sorted(set(entry) - set(REQUIRED_FIELDS) - set(OPTIONAL_FIELDS))
+        if unknown:
+            raise SystemExit(
+                f"{path}: difference {case_id!r} has unknown key(s) {', '.join(unknown)}; "
+                f"expected {', '.join(REQUIRED_FIELDS + OPTIONAL_FIELDS)}"
+            )
+        fields = entry.setdefault("fields", [])
+        if not isinstance(fields, list) or not all(
             isinstance(field, str) and field for field in fields
         ):
             raise SystemExit(f"{path}: difference {case_id!r} must list non-empty fields")
+        if len(fields) != len(set(fields)):
+            raise SystemExit(f"{path}: difference {case_id!r} repeats a field")
+        for field in fields:
+            if field == "fields":
+                raise SystemExit(
+                    f"{path}: difference {case_id!r} lists \"fields\", which would release the "
+                    "whole observation; list each differing field as \"fields.<name>\""
+                )
+            name = field.removeprefix("fields.")
+            if field.startswith("fields.") and name and name not in FAILURE_FIELDS:
+                continue
+            if field not in TOP_LEVEL_KEYS:
+                raise SystemExit(
+                    f"{path}: difference {case_id!r} lists unknown field {field!r}; expected "
+                    f"{', '.join(TOP_LEVEL_KEYS)} or \"fields.<name>\" (use `panic` and `steps` "
+                    "for failures)"
+                )
+        if not fields and "panic" not in entry:
+            raise SystemExit(
+                f"{path}: difference {case_id!r} releases nothing; list fields or a panic"
+            )
         status = entry["status"]
         if status not in DIFFERENCE_STATUSES:
             raise SystemExit(
@@ -143,6 +181,11 @@ def load_differences(path):
             raise SystemExit(
                 f"{path}: difference {case_id!r} has an empty panic fingerprint"
             )
+        if "steps" in entry and "panic" not in entry:
+            raise SystemExit(
+                f"{path}: difference {case_id!r} lists steps without a panic; a failing step "
+                "records its panic as fields.panic, so add the first failing step's panic as `panic`"
+            )
         if status in ("pending", "bug", "known-bug") and "issue" not in entry:
             raise SystemExit(
                 f"{path}: difference {case_id!r} is {status} but has no tracking issue"
@@ -151,23 +194,6 @@ def load_differences(path):
             raise SystemExit(f"{path}: duplicate difference id {case_id!r}")
         differences[case_id] = entry
     return differences
-
-
-def compound_cases(sm, qjs):
-    """Cases that run more than one independent scenario.
-
-    A `Steps` case records `fields.step_failures` whenever a scenario panics, including the
-    scenarios that never ran after the first panic. A single `fields = ["fields"]` entry would
-    then absorb a new failure in a scenario nobody listed, so those cases must name their steps.
-    """
-    compound = set()
-    for case_id in set(sm) & set(qjs):
-        for case in (sm[case_id], qjs[case_id]):
-            fields = case.get("fields")
-            if isinstance(fields, dict) and "step_failures" in fields:
-                compound.add(case_id)
-                break
-    return compound
 
 
 def failed_steps(case):
@@ -193,10 +219,20 @@ def panic_message(case):
     return panic if isinstance(panic, str) else None
 
 
-def matches_difference(left, right, difference):
-    fields = difference["fields"]
-    if not fields:
-        return False
+def observation_fields(case):
+    fields = case.get("fields")
+    return fields if isinstance(fields, dict) else {}
+
+
+def difference_problems(left, right, difference):
+    """Compares `right` (QuickJS) with `left` (SpiderMonkey) under one allowlist entry.
+
+    Returns `(uncovered, stale)`: the differences the entry does not release, and the parts of the
+    entry that no longer apply. Both empty means the entry releases the difference exactly.
+    """
+    listed = difference["fields"]
+    listed_keys = {field for field in listed if not field.startswith("fields.")}
+    listed_fields = {field.removeprefix("fields.") for field in listed if field.startswith("fields.")}
     panic = difference.get("panic")
     left_panic = panic_message(left)
     right_panic = panic_message(right)
@@ -204,20 +240,73 @@ def matches_difference(left, right, difference):
     # QuickJS difference, so no allowlist entry may absorb it: `panic` fingerprints describe the
     # QuickJS side only, and an entry without one licenses fields, not a crash on either side.
     if left_panic is not None:
-        return False
-    if panic is None:
-        if right_panic is not None:
-            return False
-    elif right_panic != panic:
-        return False
-    remaining_left = {key: value for key, value in left.items() if key not in fields}
-    remaining_right = {key: value for key, value in right.items() if key not in fields}
-    if remaining_left != remaining_right:
-        return False
-    # `fields = ["fields"]` must not silently absorb a new sub-scenario failure. Every step that
-    # failed on either engine has to be named in the allowlist so the divergence stays visible.
-    observed_steps = set(failed_steps(left)) | set(failed_steps(right))
-    return observed_steps <= set(difference.get("steps", ()))
+        return [f"SpiderMonkey panicked: {left_panic!r}"], []
+    uncovered = []
+    stale = []
+    if right_panic is not None and right_panic != panic:
+        uncovered.append(
+            f"QuickJS panicked: {right_panic!r}"
+            + ("" if panic is None else f", the entry's fingerprint is {panic!r}")
+        )
+    elif right_panic is None and panic is not None:
+        stale.append("QuickJS no longer panics; remove `panic`")
+
+    for key in sorted((set(left) | set(right)) - {"id", "fields"}):
+        if key in listed_keys:
+            if left.get(key) == right.get(key):
+                stale.append(f"{key} no longer differs; remove it from `fields`")
+        elif left.get(key) != right.get(key):
+            uncovered.append(f"{key} differs")
+
+    # A case that panics stops recording, and a failed step drops its own observations, so the
+    # fields QuickJS lacks are only accounted for by a panic the entry fingerprints. This relies on
+    # a case recording the same fields on both engines up to that panic, which holds because the
+    # cases record unconditionally or branch only on their own data.
+    left_fields = observation_fields(left)
+    right_fields = observation_fields(right)
+    lost = 0
+    for name in sorted((set(left_fields) | set(right_fields)) - set(FAILURE_FIELDS)):
+        in_left = name in left_fields
+        in_right = name in right_fields
+        if name in listed_fields:
+            if not in_right:
+                stale.append(f"fields.{name} is not recorded by QuickJS; remove it from `fields`")
+            elif in_left and left_fields[name] == right_fields[name]:
+                stale.append(f"fields.{name} no longer differs; remove it from `fields`")
+        elif in_left and in_right:
+            if left_fields[name] != right_fields[name]:
+                uncovered.append(f"fields.{name} differs")
+        elif in_right:
+            uncovered.append(f"fields.{name} is recorded only by QuickJS")
+        elif right_panic is None:
+            uncovered.append(f"fields.{name} is missing on QuickJS")
+        elif right_panic != panic:
+            lost += 1
+    if lost:
+        uncovered.append(f"{lost} SpiderMonkey fields are missing after the QuickJS panic")
+    for name in sorted(listed_fields - set(left_fields) - set(right_fields)):
+        stale.append(f"fields.{name} is recorded by neither engine; remove it from `fields`")
+
+    failed = set(failed_steps(right))
+    steps = set(difference.get("steps", ()))
+    for step in sorted(failed - steps):
+        uncovered.append(f"step {step} failed but is not in `steps`")
+    for step in sorted(steps - failed):
+        stale.append(f"step {step} no longer fails; remove it from `steps`")
+    return uncovered, stale
+
+
+def summary(difference, *details, matched=True):
+    """The parenthesised description of an entry in the report."""
+    parts = []
+    if difference["fields"]:
+        parts.append(f"fields: {', '.join(sorted(difference['fields']))}")
+    if difference.get("steps"):
+        parts.append(f"steps: {', '.join(difference['steps'])}")
+    parts.extend(details)
+    if matched and difference.get("panic"):
+        parts.append("panic: matched")
+    return ", ".join(parts)
 
 
 def main(argv):
@@ -250,15 +339,6 @@ def main(argv):
     qjs = load(arguments[1], "quickjs")
     differences = load_differences(arguments[2] if len(arguments) == 3 else None)
     expected = load_expected_cases(cases_path) if cases_path else None
-    compound = compound_cases(sm, qjs)
-    for case_id in sorted(set(compound) & set(differences)):
-        difference = differences[case_id]
-        if difference["fields"] == ["fields"] and "steps" not in difference:
-            raise SystemExit(
-                f"{arguments[2] if len(arguments) == 3 else 'quickjs-difference-allowlist.toml'}: "
-                f"difference {case_id!r} uses fields = [\"fields\"] for a compound case; "
-                "list the failing steps instead"
-            )
 
     expected_sm = load_expected_cases(sm_cases_path) if sm_cases_path else expected
     expected_qjs = load_expected_cases(qjs_cases_path) if qjs_cases_path else expected
@@ -276,6 +356,7 @@ def main(argv):
         inventory_mismatches = sorted(expected_sm_cases ^ expected_qjs_cases)
     mismatches = []
     known = []
+    stale_parts = {}
     compared_cases = set(sm) & set(qjs)
     for case_id in sorted(compared_cases):
         left = sm[case_id]
@@ -283,18 +364,26 @@ def main(argv):
         if left == right:
             continue
         difference = differences.get(case_id)
-        if difference and matches_difference(left, right, difference):
-            known.append((case_id, left, right, difference))
+        if difference is None:
+            mismatches.append((case_id, left, right, ["no allowlist entry for this case"], []))
+            continue
+        uncovered, stale_entry = difference_problems(left, right, difference)
+        if uncovered:
+            mismatches.append((case_id, left, right, uncovered, stale_entry))
+        elif stale_entry:
+            stale_parts[case_id] = stale_entry
         else:
-            mismatches.append((case_id, left, right))
+            known.append((case_id, left, right, difference))
 
     known_ids = {case_id for case_id, _, _, _ in known}
-    mismatch_ids = {case_id for case_id, _, _ in mismatches}
+    mismatch_ids = {case_id for case_id, _, _, _, _ in mismatches}
     stale = []
     for case_id in sorted(differences):
         difference = differences[case_id]
         if case_id in compared_cases:
-            if case_id not in known_ids and case_id not in mismatch_ids:
+            if case_id in stale_parts:
+                stale.append((case_id, difference, "; ".join(stale_parts[case_id])))
+            elif case_id not in known_ids and case_id not in mismatch_ids:
                 stale.append((case_id, difference, "listed case no longer differs"))
         elif (
             expected_sm_cases is not None
@@ -310,34 +399,23 @@ def main(argv):
     bugs = 0
     for case_id, left, right, difference in known:
         status = difference["status"]
+        severity = f"severity: {difference['severity']}"
         if status == "known-bug":
             bugs += 1
-            print(
-                f"known QuickJS bug: {case_id} "
-                f"(fields: {', '.join(sorted(difference['fields']))}, "
-                f"severity: {difference['severity']}"
-                + (", panic: matched" if difference.get("panic") else "")
-                + ")"
-            )
+            print(f"known QuickJS bug: {case_id} ({summary(difference, severity)})")
             print(f"  issue: {difference['issue']}")
         elif status in RELEASED_STATUSES:
             released += 1
             print(
                 f"known QuickJS defect: {case_id} "
-                f"(fields: {', '.join(sorted(difference['fields']))}, "
-                f"status: {status}, severity: {difference['severity']}"
-                + (", panic: matched" if difference.get("panic") else "")
-                + ")"
+                f"({summary(difference, f'status: {status}', severity)})"
             )
             if difference.get("issue"):
                 print(f"  issue: {difference['issue']}")
         else:
             print(
                 f"unaccepted QuickJS defect: {case_id} "
-                f"(fields: {', '.join(sorted(difference['fields']))}, "
-                f"status: {status}, severity: {difference['severity']}"
-                + (", panic: matched" if difference.get("panic") else "")
-                + ")"
+                f"({summary(difference, f'status: {status}', severity)})"
             )
             if difference.get("issue"):
                 print(f"  issue: {difference['issue']}")
@@ -359,11 +437,14 @@ def main(argv):
         print(f"case inventory mismatch between engines: {case_id}")
     for case_id, difference, reason in stale:
         print(
-            f"stale known QuickJS defect: {case_id} "
-            f"(fields: {', '.join(sorted(difference['fields']))}, {reason})"
+            f"stale known QuickJS defect: {case_id} ({summary(difference, reason, matched=False)})"
         )
-    for case_id, left, right in mismatches:
+    for case_id, left, right, uncovered, stale_entry in mismatches:
         print(f"mismatch: {case_id}")
+        for problem in uncovered:
+            print(f"  not covered: {problem}")
+        for problem in stale_entry:
+            print(f"  also stale: {problem}")
         print(f"  SpiderMonkey: {json.dumps(left, sort_keys=True)}")
         print(f"  QuickJS:      {json.dumps(right, sort_keys=True)}")
 

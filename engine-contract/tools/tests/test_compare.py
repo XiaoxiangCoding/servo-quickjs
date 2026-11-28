@@ -19,9 +19,18 @@ import compare
 DIFFERENCES_HEADER = """
 [[difference]]
 id = "case.one"
-fields = ["fields"]
+fields = ["fields.value"]
 reason = "QuickJS differs in this field"
 owner = "servo-quickjs"
+"""
+
+ENTRY_WITHOUT_FIELDS = """
+[[difference]]
+id = "case.one"
+reason = "QuickJS differs in this case"
+owner = "servo-quickjs"
+status = "accepted"
+severity = "P3"
 """
 
 
@@ -131,23 +140,187 @@ class CompareTest(unittest.TestCase):
                     with self.assertRaisesRegex(SystemExit, "cannot release"):
                         self.run_compare(status, severity)
 
-    def test_rejects_a_case_level_entry_for_a_compound_case(self):
-        sm = self.coverage(
-            "spidermonkey-contract-results.jsonl",
-            {"first": True, "second": True},
-        )
-        qjs = self.coverage(
-            "quickjs-contract-results.jsonl",
-            {"first": False, "step_failures": [{"step": "second", "panic": "boom"}]},
-        )
-        differences = self.write(
+    def record(self, name, fields, **keys):
+        record = {
+            "id": "case.one",
+            "engine": self.engine_of(name),
+            "fields": fields,
+            "exception": None,
+            "apis": ["JS_Test"],
+        }
+        record.update(keys)
+        return self.write(name, json.dumps(record) + "\n")
+
+    def entry(self, *lines):
+        """An accepted P3 entry for `case.one` with the given extra TOML lines."""
+        return self.write(
             "quickjs-difference-allowlist.toml",
-            DIFFERENCES_HEADER
-            + 'status = "accepted"\n'
-            + 'severity = "P3"\n',
+            '[[difference]]\nid = "case.one"\n'
+            + "".join(f"{line}\n" for line in lines)
+            + 'reason = "QuickJS differs"\nowner = "servo-quickjs"\n'
+            + 'status = "accepted"\nseverity = "P3"\n',
         )
-        with self.assertRaisesRegex(SystemExit, "compound case"):
-            compare.main(["compare.py", sm, qjs, differences])
+
+    def compare_case(self, sm_fields, qjs_fields, *entry_lines, sm_keys=None, qjs_keys=None):
+        sm = self.record("spidermonkey-contract-results.jsonl", sm_fields, **(sm_keys or {}))
+        qjs = self.record("quickjs-contract-results.jsonl", qjs_fields, **(qjs_keys or {}))
+        argv = ["compare.py", sm, qjs]
+        if entry_lines:
+            argv.append(self.entry(*entry_lines))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            result = compare.main(argv)
+        return result, output.getvalue()
+
+    def test_rejects_an_entry_that_releases_the_whole_observation(self):
+        with self.assertRaisesRegex(SystemExit, "release the whole observation"):
+            compare.load_differences(self.entry('fields = ["fields"]'))
+
+    def test_rejects_an_unknown_field_name(self):
+        for field in ("value", "exit", "fields.", "fields.panic", "fields.step_failures"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(SystemExit, "unknown field"):
+                    compare.load_differences(self.entry(f'fields = ["{field}"]'))
+
+    def test_rejects_a_repeated_field(self):
+        with self.assertRaisesRegex(SystemExit, "repeats a field"):
+            compare.load_differences(self.entry('fields = ["fields.value", "fields.value"]'))
+
+    def test_rejects_an_entry_that_releases_nothing(self):
+        with self.assertRaisesRegex(SystemExit, "releases nothing"):
+            compare.load_differences(self.entry())
+
+    def test_rejects_steps_without_a_panic(self):
+        with self.assertRaisesRegex(SystemExit, "steps without a panic"):
+            compare.load_differences(self.entry('fields = ["fields.value"]', 'steps = ["one"]'))
+
+    def test_rejects_an_unknown_entry_key(self):
+        with self.assertRaisesRegex(SystemExit, r"unknown key\(s\) step;"):
+            compare.load_differences(self.entry('fields = ["fields.value"]', 'step = ["one"]'))
+
+    def test_compares_the_unlisted_fields_of_an_allowlisted_case(self):
+        result, output = self.compare_case(
+            {"value": True, "other": 1}, {"value": False, "other": 2}, 'fields = ["fields.value"]'
+        )
+        self.assertEqual(result, 1, output)
+        self.assertIn("mismatch: case.one", output)
+        self.assertIn("not covered: fields.other differs", output)
+
+    def test_rejects_a_field_recorded_only_by_quickjs(self):
+        result, output = self.compare_case(
+            {"value": True}, {"value": False, "extra": 1}, 'fields = ["fields.value"]'
+        )
+        self.assertEqual(result, 1, output)
+        self.assertIn("not covered: fields.extra is recorded only by QuickJS", output)
+
+    def test_rejects_missing_fields_without_a_panic(self):
+        result, output = self.compare_case(
+            {"value": True, "later": 1}, {"value": False}, 'fields = ["fields.value"]'
+        )
+        self.assertEqual(result, 1, output)
+        self.assertIn("not covered: fields.later is missing on QuickJS", output)
+
+    def test_accepts_fields_lost_to_a_fingerprinted_panic(self):
+        result, output = self.compare_case(
+            {"value": True, "later": 1}, {"panic": "boom"}, 'panic = "boom"'
+        )
+        self.assertEqual(result, 0, output)
+        self.assertIn("(status: accepted, severity: P3, panic: matched)", output)
+
+    def test_rejects_a_panic_that_does_not_match_the_fingerprint(self):
+        result, output = self.compare_case(
+            {"value": True, "later": 1}, {"panic": "bang"}, 'panic = "boom"'
+        )
+        self.assertEqual(result, 1, output)
+        self.assertIn("not covered: QuickJS panicked: 'bang', the entry's fingerprint is 'boom'", output)
+        self.assertIn("not covered: 2 SpiderMonkey fields are missing after the QuickJS panic", output)
+        self.assertNotIn("is missing on QuickJS", output)
+
+    def test_rejects_a_panic_without_a_fingerprint(self):
+        result, output = self.compare_case(
+            {"value": True}, {"panic": "bang"}, 'fields = ["fields.value"]'
+        )
+        self.assertEqual(result, 1, output)
+        self.assertIn("not covered: QuickJS panicked: 'bang'", output)
+        self.assertNotIn("fingerprint is", output)
+
+    def test_rejects_an_unlisted_top_level_difference(self):
+        result, output = self.compare_case(
+            {"value": True},
+            {"value": False},
+            'fields = ["fields.value"]',
+            qjs_keys={"apis": ["JS_Other"]},
+        )
+        self.assertEqual(result, 1, output)
+        self.assertIn("not covered: apis differs", output)
+
+    def test_rejects_an_unexplained_exit_behind_a_matching_panic(self):
+        result, output = self.compare_case(
+            {"value": True},
+            {"panic": "boom"},
+            'panic = "boom"',
+            qjs_keys={"exit": "terminated by signal 11"},
+        )
+        self.assertEqual(result, 1, output)
+        self.assertIn("not covered: exit differs", output)
+
+    def test_says_when_a_differing_case_has_no_entry(self):
+        result, output = self.compare_case({"value": True}, {"value": False})
+        self.assertEqual(result, 1, output)
+        self.assertIn("not covered: no allowlist entry for this case", output)
+
+    def assert_stale(self, result, output, reason):
+        self.assertEqual(result, 1, output)
+        self.assertIn("stale known QuickJS defect: case.one", output)
+        self.assertIn(reason, output)
+        self.assertNotIn("mismatch: case.one", output)
+
+    def test_reports_a_listed_field_that_no_longer_differs_as_stale(self):
+        result, output = self.compare_case(
+            {"value": True, "other": 1},
+            {"value": True, "other": 2},
+            'fields = ["fields.value", "fields.other"]',
+        )
+        self.assert_stale(result, output, "fields.value no longer differs; remove it from `fields`")
+
+    def test_reports_a_listed_top_level_key_that_no_longer_differs_as_stale(self):
+        result, output = self.compare_case(
+            {"value": True}, {"value": False}, 'fields = ["apis", "fields.value"]'
+        )
+        self.assert_stale(result, output, "apis no longer differs; remove it from `fields`")
+
+    def test_reports_a_field_neither_engine_records_as_stale(self):
+        result, output = self.compare_case(
+            {"value": True}, {"value": False}, 'fields = ["fields.value", "fields.typo"]'
+        )
+        self.assert_stale(result, output, "fields.typo is recorded by neither engine")
+
+    def test_reports_a_listed_field_lost_to_the_panic_as_stale(self):
+        result, output = self.compare_case(
+            {"value": True, "later": 1},
+            {"panic": "boom"},
+            'fields = ["fields.later"]',
+            'panic = "boom"',
+        )
+        self.assert_stale(result, output, "fields.later is not recorded by QuickJS")
+
+    def test_reports_a_panic_that_no_longer_happens_as_stale(self):
+        result, output = self.compare_case(
+            {"value": True}, {"value": False}, 'fields = ["fields.value"]', 'panic = "boom"'
+        )
+        self.assert_stale(result, output, "QuickJS no longer panics; remove `panic`")
+
+    def test_reports_a_listed_step_that_no_longer_fails_as_stale(self):
+        result, output = self.compare_case(
+            {"value": True},
+            {
+                "panic": "assertion failed",
+                "step_failures": [{"step": "one", "panic": "assertion failed"}],
+            },
+            'steps = ["one", "two"]',
+            'panic = "assertion failed"',
+        )
+        self.assert_stale(result, output, "step two no longer fails; remove it from `steps`")
 
     def test_rejects_an_empty_results_file(self):
         sm = self.write("spidermonkey-contract-results.jsonl", "")
@@ -254,10 +427,7 @@ class CompareTest(unittest.TestCase):
         qjs = self.observation("quickjs-contract-results.jsonl", fields={"value": False, "extra": 2})
         differences = self.write(
             "quickjs-difference-allowlist.toml",
-            DIFFERENCES_HEADER
-            .replace('fields = ["fields"]', 'fields = ["value"]')
-            + 'status = "accepted"\n'
-            + 'severity = "P3"\n',
+            DIFFERENCES_HEADER + 'status = "accepted"\n' + 'severity = "P3"\n',
         )
         output = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
@@ -321,16 +491,17 @@ class CompareTest(unittest.TestCase):
         )
         differences = self.write(
             "quickjs-difference-allowlist.toml",
-            DIFFERENCES_HEADER
-            .replace('fields = ["fields"]', 'fields = ["fields"]\nsteps = ["old_step"]')
-            + 'status = "accepted"\n'
-            + 'severity = "P3"\n',
+            ENTRY_WITHOUT_FIELDS.replace(
+                'owner =',
+                'steps = ["old_step"]\npanic = "assertion `left == right` failed"\nowner =',
+            ),
         )
         output = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             result = compare.main(["compare.py", sm, qjs, differences])
         self.assertEqual(result, 1, output.getvalue())
         self.assertIn("mismatch: case.one", output.getvalue())
+        self.assertIn("step new_step failed but is not in `steps`", output.getvalue())
 
     def test_releases_an_entry_that_names_every_failed_step(self):
         sm = self.observation("spidermonkey-contract-results.jsonl", fields={"value": True})
@@ -343,11 +514,9 @@ class CompareTest(unittest.TestCase):
         )
         differences = self.write(
             "quickjs-difference-allowlist.toml",
-            DIFFERENCES_HEADER
-            .replace('fields = ["fields"]', 'fields = ["fields"]\nsteps = ["one"]')
-            + 'panic = "assertion failed"\n'
-            + 'status = "accepted"\n'
-            + 'severity = "P3"\n',
+            ENTRY_WITHOUT_FIELDS.replace(
+                'owner =', 'steps = ["one"]\npanic = "assertion failed"\nowner ='
+            ),
         )
         output = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
@@ -359,8 +528,7 @@ class CompareTest(unittest.TestCase):
         qjs = self.coverage("quickjs-contract-results.jsonl", {"value": False})
         differences = self.write(
             "quickjs-difference-allowlist.toml",
-            DIFFERENCES_HEADER
-            .replace('fields = ["fields"]', 'fields = ["fields"]\nsteps = []')
+            DIFFERENCES_HEADER.replace('fields = ["fields.value"]', 'fields = ["fields.value"]\nsteps = []')
             + 'status = "accepted"\n'
             + 'severity = "P3"\n',
         )
@@ -429,7 +597,7 @@ class CompareTest(unittest.TestCase):
             + 'severity = "P3"\n'
             + '\n[[difference]]\n'
             + 'id = "case.two"\n'
-            + 'fields = ["fields"]\n'
+            + 'fields = ["fields.value"]\n'
             + 'reason = "not selected"\n'
             + 'owner = "servo-quickjs"\n'
             + 'status = "accepted"\n'
