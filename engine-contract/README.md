@@ -357,7 +357,10 @@ At the process level, `run.sh` sets `CONTRACT_ISOLATE_CASES=1` by default. The t
 re-executes the binary once per case and merges each child's JSONL record into one file, so a
 segfault, abort or `panic = "abort"` in one case cannot hide the cases after it. A child that dies
 without recording is written as a failure observation with its exit status, and a child that exits
-non-zero makes the parent exit non-zero even when it did record an observation. Set
+non-zero makes the parent exit non-zero even when it did record an observation. A child that
+recorded an observation and then failed for any reason other than its recorded panic, for example
+a crash while the runtime is torn down, gets an `exit` key in its record, so the comparison fails
+instead of treating the observation as a pass. Set
 `CONTRACT_ISOLATE_CASES=0` to run everything in one process for debugging; a crash then truncates
 the run.
 

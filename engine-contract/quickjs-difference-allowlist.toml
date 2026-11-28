@@ -276,7 +276,7 @@ severity = "P3"
 [[difference]]
 id = "streaming.consume_callback"
 fields = ["fields"]
-panic = "case process exited without recording a result (terminated by a signal)"
+panic = "case process exited without recording a result (terminated by signal 6)"
 reason = "Accepted capability difference: QuickJS has no WebAssembly, so it has no stream consumer to drive. The shim binds the StreamConsumer glue entry points to qjs_todo! and the first call aborts the case process. This is a missing engine feature, not a shim bug to fix."
 owner = "servo-quickjs"
 status = "accepted"

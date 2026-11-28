@@ -79,6 +79,10 @@ jobs:
             engine-contract/target/contract/spidermonkey-contract-results.jsonl
           diff -u engine-contract/spidermonkey-contract-cases.json \
             engine-contract/target/contract/spidermonkey-contract-cases.json
+      # The isolated runner's exit handling only acts when a case crashes, which no case does today.
+      - name: Isolated runner unit tests
+        run: cargo test --locked --offline --release -p engine_contract_tests -- support::isolated_exit_tests
+        working-directory: engine-contract
       - name: QuickJS contract against the SpiderMonkey golden records
         run: engine-contract/tools/run.sh run-quickjs-against-golden
 

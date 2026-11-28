@@ -862,18 +862,17 @@ fn run_one_isolated_case(case: &str, engine: &str, results: &str) -> IsolatedRec
 
     if let Ok(text) = std::fs::read_to_string(&output) {
         if let Some(line) = text.lines().rev().find(|line| !line.trim().is_empty()) {
-            return IsolatedRecord {
-                line: line.trim().to_owned(),
-                crashed: false,
-                failed: !status.success(),
-            };
+            if let Some(line) = with_unexplained_exit(line.trim(), &status) {
+                return IsolatedRecord {
+                    line,
+                    crashed: false,
+                    failed: !status.success(),
+                };
+            }
         }
     }
 
-    let description = match status.code() {
-        Some(code) => format!("exit {code}"),
-        None => "terminated by a signal".to_owned(),
-    };
+    let description = exit_description(status.code(), exit_signal(&status));
     let reference_apis = reference_apis(case);
     let line = serde_json::json!({
         "id": case,
@@ -889,6 +888,99 @@ fn run_one_isolated_case(case: &str, engine: &str, results: &str) -> IsolatedRec
         line,
         crashed: true,
         failed: true,
+    }
+}
+
+/// Returns the child's record with the `exit` key [`unexplained_exit`] asks for, or `None` when a
+/// failed child left a record that cannot be parsed, which is then reported like a crash.
+fn with_unexplained_exit(line: &str, status: &std::process::ExitStatus) -> Option<String> {
+    if status.success() {
+        return Some(line.to_owned());
+    }
+    let mut record: serde_json::Value = serde_json::from_str(line).ok()?;
+    let recorded_panic = record
+        .get("fields")
+        .and_then(|fields| fields.get("panic"))
+        .is_some();
+    match unexplained_exit(recorded_panic, status.code(), exit_signal(status)) {
+        None => Some(line.to_owned()),
+        Some(exit) => {
+            record["exit"] = serde_json::Value::String(exit);
+            Some(record.to_string())
+        },
+    }
+}
+
+/// The `exit` value for a child that recorded an observation and then failed in a way the record
+/// does not explain, or `None` when the exit is expected.
+///
+/// A case that panicked records `fields.panic`, and the test then fails with exit code 101; a later
+/// panic in the same process exits the same way and is not told apart. Any other failure happened
+/// after the observation was written, for example while the runtime was torn down, so the record
+/// alone would compare as if the case had passed.
+fn unexplained_exit(
+    recorded_panic: bool,
+    code: Option<i32>,
+    signal: Option<i32>,
+) -> Option<String> {
+    if code == Some(0) || (recorded_panic && code == Some(101)) {
+        return None;
+    }
+    Some(exit_description(code, signal))
+}
+
+fn exit_description(code: Option<i32>, signal: Option<i32>) -> String {
+    match (code, signal) {
+        (Some(code), _) => format!("exit {code}"),
+        (None, Some(signal)) => format!("terminated by signal {signal}"),
+        (None, None) => "terminated by a signal".to_owned(),
+    }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    std::os::unix::process::ExitStatusExt::signal(status)
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+/// Run alone (`cargo test -- support::isolated_exit_tests`): the contract test in the same binary
+/// ends its process when it runs isolated.
+mod isolated_exit_tests {
+    use super::unexplained_exit;
+
+    #[test]
+    fn success_and_a_recorded_panic_are_expected() {
+        assert_eq!(unexplained_exit(false, Some(0), None), None);
+        assert_eq!(unexplained_exit(true, Some(0), None), None);
+        assert_eq!(unexplained_exit(true, Some(101), None), None);
+    }
+
+    #[test]
+    fn other_failures_after_recording_are_unexplained() {
+        assert_eq!(
+            unexplained_exit(false, Some(101), None).as_deref(),
+            Some("exit 101")
+        );
+        assert_eq!(
+            unexplained_exit(true, Some(1), None).as_deref(),
+            Some("exit 1")
+        );
+        assert_eq!(
+            unexplained_exit(true, None, Some(11)).as_deref(),
+            Some("terminated by signal 11")
+        );
+        assert_eq!(
+            unexplained_exit(false, None, Some(6)).as_deref(),
+            Some("terminated by signal 6")
+        );
+        assert_eq!(
+            unexplained_exit(false, None, None).as_deref(),
+            Some("terminated by a signal")
+        );
     }
 }
 
