@@ -319,7 +319,6 @@ unsafe extern "C" fn throw_value(cx: *mut RawJSContext, _argc: u32, _vp: *mut Va
 thread_local! {
     static GLOBAL: RefCell<*mut JSObject> = const { RefCell::new(ptr::null_mut()) };
     static CALLERS: RefCell<Vec<Option<(String, u32, u32)>>> = const { RefCell::new(Vec::new()) };
-    static CALLER_PRIVATES: RefCell<Vec<Option<i32>>> = const { RefCell::new(Vec::new()) };
     static LINES: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -332,17 +331,19 @@ fn record_caller(cx: &mut JSContext) {
     if !global.is_null() {
         assert_eq!(global, GLOBAL.with(|g| *g.borrow()));
     }
+    CALLERS.with(|c| c.borrow_mut().push(caller));
+}
+
+fn scripted_caller_private(cx: &mut JSContext) -> Option<i32> {
     rooted!(&in(cx) let mut private = UndefinedValue());
     unsafe {
         js::rust::wrappers2::JS_GetScriptedCallerPrivate(cx, private.handle_mut());
     }
-    let private = if private.get().is_undefined() {
+    if private.get().is_undefined() {
         None
     } else {
         Some(private.get().to_int32())
-    };
-    CALLER_PRIVATES.with(|p| p.borrow_mut().push(private));
-    CALLERS.with(|c| c.borrow_mut().push(caller));
+    }
 }
 
 unsafe fn set_global(cx: &mut JSContext, name: &CStr, value: JSVal) {
@@ -593,13 +594,7 @@ foo();";
         ));
     }
     let callers = CALLERS.with(|c| c.borrow().clone());
-    let privates = CALLER_PRIVATES.with(|p| p.borrow().clone());
     assert_eq!(callers.len(), 4);
-    assert_eq!(
-        privates,
-        [Some(77), Some(77), Some(77), Some(77)],
-        "JS_GetScriptedCallerPrivate must return the script's private value"
-    );
     assert_eq!(callers[1], None);
     for (index, caller) in callers.into_iter().enumerate() {
         if index == 1 {
@@ -641,7 +636,6 @@ foo();";
     let lines = LINES.with(|l| l.borrow().clone());
     vec![
         ("callers", Observed::String(format!("{callers:?}"))),
-        ("caller_privates", Observed::String(format!("{privates:?}"))),
         ("lines", Observed::String(format!("{lines:?}"))),
         (
             "names",
@@ -665,6 +659,15 @@ foo();";
 }
 
 const STACK_STEP_SCRIPT: &str = "function probeTarget() {\n  probe();\n}\nprobeTarget();";
+
+/// `HideScriptedCaller` affects the caller lookup but must not hide the script's private value
+/// from `JS_GetScriptedCallerPrivate`.
+const HIDDEN_CALLER_PRIVATE_SCRIPT: &str = "\
+function probeTarget() {
+  hideScriptedCaller();
+  probe();
+}
+probeTarget();";
 
 thread_local! {
     static STACK_STEP_RESULT: RefCell<String> = const { RefCell::new(String::new()) };
@@ -766,6 +769,64 @@ fn eval_stack_probe(
     take_stack_step_result()
 }
 
+/// Runs the hidden-caller script with a script private value set, so SpiderMonkey can return it
+/// from `JS_GetScriptedCallerPrivate` while the caller itself is hidden.
+fn eval_hidden_caller_private(engine: &JSEngine) -> String {
+    let mut runtime = Runtime::new(engine.handle());
+    let cx = runtime.cx();
+    unsafe {
+        rooted!(&in(cx) let global = JS_NewGlobalObject(
+            cx,
+            &SIMPLE_GLOBAL_CLASS,
+            ptr::null_mut(),
+            OnNewGlobalHookOption::FireOnNewGlobalHook,
+            &*RealmOptions::default(),
+        ));
+        assert!(!global.get().is_null(), "JS_NewGlobalObject returned null");
+        let mut realm = AutoRealm::new_from_handle(cx, global.handle());
+        let (global, cx) = realm.global_and_reborrow();
+        for (name, native) in [
+            (
+                c"probe",
+                hidden_caller_private_probe as unsafe extern "C" fn(_, _, _) -> _,
+            ),
+            (c"hideScriptedCaller", hide_scripted_caller),
+        ] {
+            let function = jsapi::JS_GetFunctionObject(jsapi::JS_NewFunction(
+                cx.raw_cx(),
+                Some(native),
+                0,
+                0,
+                name.as_ptr(),
+            ));
+            assert!(jsapi::JS_SetProperty(
+                cx.raw_cx(),
+                handle(&global.get()),
+                name.as_ptr(),
+                handle(&ObjectValue(function)),
+            ));
+        }
+        let options = CompileOptionsWrapper::new(cx, c"capture.js".to_owned(), 1);
+        rooted!(&in(cx) let script = jsapi::Compile1(
+            cx.raw_cx(),
+            options.ptr,
+            &mut transform_str_to_source_text(HIDDEN_CALLER_PRIVATE_SCRIPT),
+        ));
+        assert!(
+            !script.get().is_null(),
+            "compiling the hidden-caller script"
+        );
+        jsapi::SetScriptPrivate(script.get(), &js::jsval::Int32Value(77));
+        rooted!(&in(cx) let mut rval = UndefinedValue());
+        assert!(js::rust::wrappers2::JS_ExecuteScript(
+            cx,
+            script.handle(),
+            rval.handle_mut()
+        ));
+    }
+    take_stack_step_result()
+}
+
 fn run_stack_step(name: &'static str, probe: impl FnOnce() -> String, expected: &str) {
     take_stack_step_result();
     let observed = probe();
@@ -806,6 +867,27 @@ stack_probe!(build_stack_string_probe, |cx, stack| {
         "BuildStackString returned null".to_owned()
     }
 });
+
+probe!(hidden_caller_private_probe, |cx| {
+    let private = match scripted_caller_private(&mut cx) {
+        Some(private) => format!("{private}"),
+        None => "undefined".to_owned(),
+    };
+    jsapi::UnhideScriptedCaller(cx.raw_cx());
+    private
+});
+
+unsafe extern "C" fn hide_scripted_caller(
+    cx: *mut RawJSContext,
+    argc: u32,
+    vp: *mut Value,
+) -> bool {
+    jsapi::HideScriptedCaller(cx);
+    jsapi::CallArgs::from_vp(vp, argc)
+        .rval()
+        .set(UndefinedValue());
+    true
+}
 
 stack_probe!(get_saved_frame_line_probe, |cx, stack| {
     let mut line = 0;
@@ -1029,6 +1111,15 @@ fn errors_api_cases(engine: &JSEngine) {
     );
 
     crate::support::run_case(
+        "errors.get_scripted_caller_private_api",
+        &["HideScriptedCaller", "JS_GetScriptedCallerPrivate"],
+        || {
+            let observed = eval_hidden_caller_private(engine);
+            crate::support::Observation::new(vec![("private", Observed::String(observed))])
+        },
+    );
+
+    crate::support::run_case(
         "errors.js_stack_capture_max_frames_api",
         &["JS_StackCapture_MaxFrames"],
         || {
@@ -1072,7 +1163,6 @@ pub fn run(engine: &JSEngine) {
             "JS_ErrorFromException",
             "JS_NewObject",
             "JS_GetFunctionObject",
-            "JS_GetScriptedCallerPrivate",
             "JS_NewFunction",
             "SetDOMCallbacks",
             "JS_SetPendingException",

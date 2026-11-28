@@ -28,10 +28,9 @@
 id = "rooter.trace_on_gc"
 fields = ["fields"]
 panic = "the custom rooter trace callback did not run during an explicit collection"
-reason = "Known shim defect (tracked in #24): QuickJS does not invoke CustomAutoRooter trace callbacks during an explicit collection."
+reason = "Accepted ownership difference: QuickJS does not trace Rust roots. docs/design.md:59-62 records that JS_AddExtraGCRootsTracer is a no-op and that Rust-side roots are counted or pooled instead, so a CustomAutoRooter trace callback has nothing to mark and does not run during an explicit collection."
 owner = "servo-quickjs"
-issue = "https://github.com/openharmony-rs/servo-quickjs/issues/24"
-status = "known-bug"
+status = "accepted"
 severity = "P3"
 
 [[difference]]
@@ -99,6 +98,15 @@ reason = "QuickJS reports the Error construction column; SpiderMonkey reports th
 owner = "servo-quickjs"
 status = "accepted"
 severity = "P3"
+
+[[difference]]
+id = "errors.get_scripted_caller_private_api"
+fields = ["fields", "apis"]
+reason = "Known shim defect (tracked in #33): JS_GetScriptedCallerPrivate reuses scripted_caller(), which honours HideScriptedCaller (error.rs:103-125), so the private value becomes undefined while the caller is hidden. Servo reads it from string timers (timers.rs:1127) after HideScriptedCaller."
+owner = "servo-quickjs"
+issue = "https://github.com/openharmony-rs/servo-quickjs/issues/33"
+status = "known-bug"
+severity = "P2"
 
 [[difference]]
 id = "errors.build_stack_string_api"
@@ -186,10 +194,9 @@ severity = "P3"
 id = "misc.gc_callbacks"
 fields = ["fields", "apis"]
 panic = "assertion failed: gc_callback_calls.parse::<u32>().unwrap_or(0) > 0"
-reason = "Known shim defect (tracked in #24): QuickJS keeps JS_SetGCCallback, SetGCSliceCallback, JS_AddExtraGCRootsTracer and JS_Get/SetGCParameter as silent no-ops: registered callbacks and extra-root tracers never run during JS_GC, the slice slot reports itself as already installed (the shim returns None), and GC parameters read back as 0."
+reason = "Accepted ownership difference for the callbacks and tracers: QuickJS has no tracing pass for Rust roots (docs/design.md:59-62), so JS_SetGCCallback, SetGCSliceCallback and JS_AddExtraGCRootsTracer are no-ops and the extra-root tracer never runs. The GC-parameter part is the separate, tracked defect #25 (runtime.context_lifecycle)."
 owner = "servo-quickjs"
-issue = "https://github.com/openharmony-rs/servo-quickjs/issues/24"
-status = "known-bug"
+status = "accepted"
 severity = "P3"
 
 [[difference]]
@@ -199,19 +206,17 @@ steps = ["raw_root"]
 panic = """assertion `left == right` failed: RemoveRawValueRoot did not release the object
   left: 0
  right: 1"""
-reason = "Known shim defect (tracked in #26): QuickJS's raw-value root retains an extra reference after RemoveRawValueRoot, so the object is not finalized by the following JS_GC."
+reason = "Accepted pool lifetime: RemoveRawValueRoot frees exactly the reference AddRawValueRoot took (misc.rs:64-86). The object survives the following collection because JS_NewObject's result is in the autorelease pool until the task ends (docs/design.md:29,36), not because the root kept an extra reference. The harness cannot yet drain the pool."
 owner = "servo-quickjs"
-issue = "https://github.com/openharmony-rs/servo-quickjs/issues/26"
-status = "known-bug"
+status = "accepted"
 severity = "P2"
 
 [[difference]]
 id = "realm.enter_exit_and_private"
 fields = ["fields"]
-reason = "Known shim defect (tracked in #24): QuickJS invokes the global trace hook twice for one explicit collection; SpiderMonkey invokes it once."
+reason = "Accepted trace-pass difference: QuickJS's cycle collector calls mark_children once in gc_decref (quickjs.c:6975) and again in gc_scan (:7017), so every trace hook runs once per collection pass. Patch Q41 (JS_GetGCPass) lets a tracer tell the passes apart; this is not a duplicate registration."
 owner = "servo-quickjs"
-issue = "https://github.com/openharmony-rs/servo-quickjs/issues/24"
-status = "known-bug"
+status = "accepted"
 severity = "P3"
 
 [[difference]]
@@ -236,10 +241,9 @@ severity = "P3"
 [[difference]]
 id = "class.edge_tracers"
 fields = ["fields"]
-reason = "Known shim defect (tracked in #24): SpiderMonkey keeps the four raw-slot referents (object, value, array element and a property descriptor's getter) alive while tracing and collects all of them when tracing is disabled (0 vs 4 finalizers). QuickJS binds CallObjectRootTracer, CallValueRootTracer, CallPropertyDescriptorTracer and TraceValueArray to no-ops, and its measured finalization counts are 0 in both passes; the cause of that second number is not yet established."
+reason = "Accepted ownership difference: QuickJS does not trace Rust roots, so CallObjectRootTracer, CallValueRootTracer, CallPropertyDescriptorTracer and TraceValueArray are no-ops (docs/design.md:59-62). SpiderMonkey keeps the four raw-slot referents alive while tracing and collects all of them when tracing is disabled; QuickJS records 0 finalizers in both passes."
 owner = "servo-quickjs"
-issue = "https://github.com/openharmony-rs/servo-quickjs/issues/24"
-status = "known-bug"
+status = "accepted"
 severity = "P2"
 
 [[difference]]
@@ -264,10 +268,9 @@ severity = "P3"
 id = "promise.internal_job_queue"
 fields = ["fields", "apis"]
 panic = "assertion failed: HasAnyMicroTasks(cx)"
-reason = "Known shim defect (tracked in #26): QuickJS does not enqueue promise reactions into the internal job queue exposed to HasAnyMicroTasks; RunJobs still drains QuickJS's own queue."
+reason = "Accepted internal-queue difference: this case installs QuickJS's own queue with UseInternalJobQueues (promises_test.rs:405), so reactions go to QuickJS's internal job list and HasAnyMicroTasks, which reads cx.hooks.microtasks, cannot see them. With Servo's SetJobQueue installed, enqueue_job (promise.rs:568-643) puts every job in cx.hooks.microtasks."
 owner = "servo-quickjs"
-issue = "https://github.com/openharmony-rs/servo-quickjs/issues/26"
-status = "known-bug"
+status = "accepted"
 severity = "P3"
 
 [[difference]]

@@ -8,10 +8,9 @@ File defects in <https://github.com/openharmony-rs/servo-quickjs/issues>.
 
 | Issue | Scope | Allowlist entries |
 | --- | --- | --- |
-| [#24](https://github.com/openharmony-rs/servo-quickjs/issues/24) | `JS_GC` does not walk `CustomAutoRooter`; the GC hook and tracer entry points are not wired | `rooter.trace_on_gc`, `misc.gc_callbacks`, `class.edge_tracers`, `realm.enter_exit_and_private` |
 | [#25](https://github.com/openharmony-rs/servo-quickjs/issues/25) | `JS_GetGCParameter`/`JS_SetGCParameter` do not persist, and `runtime.context_lifecycle` passes anyway | `runtime.context_lifecycle` |
-| [#26](https://github.com/openharmony-rs/servo-quickjs/issues/26) | `RemoveRawValueRoot` retains a reference; `HasAnyMicroTasks` cannot see engine-queued reactions | `misc.roots_options_memory`, `promise.internal_job_queue` |
 | [#28](https://github.com/openharmony-rs/servo-quickjs/issues/28) | `JS_FireOnNewGlobalObject` never dispatches | `debugger.new_global_object_hook` |
+| [#33](https://github.com/openharmony-rs/servo-quickjs/issues/33) | `JS_GetScriptedCallerPrivate` is hidden by `HideScriptedCaller` | `errors.get_scripted_caller_private_api` |
 
 Each issue carries the full analysis, the code locations and the reproduction command; this file
 only records which allowlist entry points at which issue.
@@ -32,6 +31,15 @@ consumer; the entry is `accepted` instead of `known-bug`.
 global's resolve and enumerate hooks have no class left to add lazily. The contract case observes
 different hook return values, but no JS-visible behaviour difference has been demonstrated.
 
-`errors.core` is also `accepted`, but one of its steps shows a separate shim defect: QuickJS records
-`JS_GetScriptedCallerPrivate` as `None` for a frame that has a private value, where SpiderMonkey
-records `Some(77)`. That deserves its own entry once the step is split out of the compound case.
+`rooter.trace_on_gc`, `class.edge_tracers`, `realm.enter_exit_and_private` and the callback/tracer
+part of `misc.gc_callbacks` are accepted because QuickJS does not trace Rust roots: the shim counts
+or pools them instead (`docs/design.md:59-62`), and its cycle collector calls a trace hook once per
+pass (`quickjs.c:6975`, `:7017`). `misc.roots_options_memory` is accepted because the object that
+survives `RemoveRawValueRoot` is held by the autorelease pool until the task ends
+(`docs/design.md:29,36`). `promise.internal_job_queue` is accepted because its case installs
+QuickJS's own queue with `UseInternalJobQueues`; with Servo's queue installed, `enqueue_job` puts
+every job in the queue that `HasAnyMicroTasks` reads.
+
+`errors.core` remains accepted only for the reported column numbers. The `JS_GetScriptedCallerPrivate`
+divergence it used to absorb is now its own case, `errors.get_scripted_caller_private_api`, tracked
+in #33.
